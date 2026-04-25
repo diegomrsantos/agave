@@ -88,16 +88,28 @@ pub struct BankForks {
     migration_status: Arc<MigrationStatus>,
 }
 
+/// Errors returned by checked BankForks insertion.
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum InsertBankError {
+    /// The bank's slot is at or below the current root.
     #[error("slot {slot} is already rooted at {root}")]
     AlreadyRooted { slot: Slot, root: Slot },
 
+    /// BankForks already contains a bank for the bank's slot.
     #[error("already contains bank for slot {0}")]
     AlreadyExists(Slot),
 
+    /// The bank's parent is not present in BankForks.
     #[error("parent slot {parent_slot} for slot {slot} is no longer in BankForks")]
     MissingParent { slot: Slot, parent_slot: Slot },
+
+    /// The bank's parent is present, but not on the current rooted fork.
+    #[error("parent slot {parent_slot} for slot {slot} is not on rooted fork {root}")]
+    ParentNotOnRootedFork {
+        slot: Slot,
+        parent_slot: Slot,
+        root: Slot,
+    },
 }
 
 impl Index<u64> for BankForks {
@@ -272,7 +284,8 @@ impl BankForks {
         self.insert_with_scheduling_mode(SchedulingMode::BlockVerification, bank)
     }
 
-    /// Inserts a bank only if the current fork graph still accepts it.
+    /// Inserts a bank with the same scheduling mode as [`Self::insert`], only
+    /// if the current fork graph still accepts it.
     ///
     /// This checked insert is intended for banks built from a `BankForks`
     /// snapshot outside the write lock. By the time the caller is ready to
@@ -298,7 +311,22 @@ impl BankForks {
         if !self.banks.contains_key(&parent_slot) {
             return Err(InsertBankError::MissingParent { slot, parent_slot });
         }
+        if !self.is_on_rooted_fork(parent_slot, root) {
+            return Err(InsertBankError::ParentNotOnRootedFork {
+                slot,
+                parent_slot,
+                root,
+            });
+        }
         Ok(())
+    }
+
+    fn is_on_rooted_fork(&self, slot: Slot, root: Slot) -> bool {
+        slot == root
+            || self
+                .descendants
+                .get(&root)
+                .is_some_and(|descendants| descendants.contains(&slot))
     }
 
     pub fn insert_with_scheduling_mode(
@@ -1265,6 +1293,62 @@ mod tests {
                 (6, vec![])
             ])
         );
+    }
+
+    #[test]
+    fn test_try_insert_rejects_parent_retained_below_root() {
+        let GenesisConfigInfo { genesis_config, .. } = create_genesis_config(10_000);
+        let bank = Bank::new_for_tests(&genesis_config);
+        let bank_forks = BankForks::new_rw_arc(bank);
+
+        extend_bank_forks(bank_forks.clone(), &[(0, 1), (1, 2)]);
+        bank_forks.write().unwrap().set_root(
+            2,
+            None,    // snapshot_controller
+            Some(1), // highest confirmed root
+        );
+
+        // Slot 1 is intentionally retained below the local root for commitment
+        // queries, but it is no longer a valid parent for new work.
+        assert!(bank_forks.read().unwrap().get(1).is_some());
+        assert_eq!(bank_forks.read().unwrap().root(), 2);
+
+        let bank_built_on_retained_ancestor = Bank::new_from_parent(
+            bank_forks.read().unwrap().get(1).unwrap(),
+            SlotLeader::default(),
+            3,
+        );
+        let before = {
+            let bank_forks = bank_forks.read().unwrap();
+            (
+                bank_forks.len(),
+                bank_forks.get(3).map(|bank| bank.bank_id()),
+            )
+        };
+
+        match bank_forks
+            .write()
+            .unwrap()
+            .try_insert(bank_built_on_retained_ancestor)
+        {
+            Ok(bank) => panic!("unexpectedly inserted bank {}", bank.slot()),
+            Err(error) => assert_eq!(
+                error,
+                InsertBankError::ParentNotOnRootedFork {
+                    slot: 3,
+                    parent_slot: 1,
+                    root: 2,
+                }
+            ),
+        }
+        let after = {
+            let bank_forks = bank_forks.read().unwrap();
+            (
+                bank_forks.len(),
+                bank_forks.get(3).map(|bank| bank.bank_id()),
+            )
+        };
+        assert_eq!(after, before);
     }
 
     #[test]
