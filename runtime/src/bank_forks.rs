@@ -298,6 +298,27 @@ impl BankForks {
         Ok(self.insert(bank))
     }
 
+    /// Validates that `bank` is still safe to insert into the current fork graph.
+    ///
+    /// This is structural validation, not full bank or consensus validation. It
+    /// is meant for banks that were built from a `BankForks` snapshot outside the
+    /// write lock. By the time the bank is ready to be committed, the root may
+    /// have moved, another bank for the same slot may have been inserted, or the
+    /// selected parent may no longer be usable.
+    ///
+    /// The accepted shape is:
+    /// - the bank's slot is above the current root,
+    /// - no bank for that slot already exists,
+    /// - the parent is still present, and
+    /// - the parent is the root or a descendant of the root.
+    ///
+    /// The last condition is stricter than parent presence. `BankForks` may
+    /// retain ancestors below the local root for commitment/RPC queries, but
+    /// those retained ancestors are not valid parents for new work.
+    ///
+    /// The caller must hold the `BankForks` write lock from this validation
+    /// through insertion. Otherwise another writer could change the fork graph
+    /// between the check and the insert.
     fn validate_insert(&self, bank: &Bank) -> Result<(), InsertBankError> {
         let slot = bank.slot();
         let parent_slot = bank.parent_slot();
@@ -311,6 +332,9 @@ impl BankForks {
         if !self.banks.contains_key(&parent_slot) {
             return Err(InsertBankError::MissingParent { slot, parent_slot });
         }
+        // Parent presence alone is not enough. Retained ancestors below root can
+        // remain in `BankForks` for commitment queries, but new work must build
+        // on the root or one of its descendants.
         if !self.is_on_rooted_fork(parent_slot, root) {
             return Err(InsertBankError::ParentNotOnRootedFork {
                 slot,
