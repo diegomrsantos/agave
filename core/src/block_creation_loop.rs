@@ -997,7 +997,7 @@ mod tests {
         forks.set_root(COMPETING_LEADER_SLOT);
 
         let before = forks.fork_state_for(CHILD_OF_STALE_PARENT_SLOT);
-        let publish_side_effects_were_called = AtomicBool::new(false);
+        let mut publish_side_effects_were_called = false;
 
         assert_eq!(
             commit_and_publish_leader_bank(
@@ -1006,7 +1006,7 @@ mod tests {
                 |_bank, _root_slot| {
                     // This publisher is where BCL assigns PoH, emits created-bank
                     // notifications, wakes BankingStage, and resets slot metrics.
-                    publish_side_effects_were_called.store(true, Ordering::Relaxed);
+                    publish_side_effects_were_called = true;
                 },
             ),
             Err(InsertBankError::MissingParent {
@@ -1017,7 +1017,7 @@ mod tests {
 
         assert_eq!(forks.fork_state_for(CHILD_OF_STALE_PARENT_SLOT), before);
         assert!(
-            !publish_side_effects_were_called.load(Ordering::Relaxed),
+            !publish_side_effects_were_called,
             "stale leader bank must not publish PoH, notification, or record-receiver side effects"
         );
     }
