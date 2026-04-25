@@ -23,6 +23,7 @@ use {
         sync::{Arc, RwLock},
         time::Instant,
     },
+    thiserror::Error,
 };
 
 /// Convenience type since often root/working banks are fetched together.
@@ -85,6 +86,18 @@ pub struct BankForks {
     /// The status tracker for the Alpenglow migration. Initialized via either
     /// the genesis or snapshot bank and then updated via block replay.
     migration_status: Arc<MigrationStatus>,
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum InsertBankError {
+    #[error("slot {slot} is already rooted at {root}")]
+    AlreadyRooted { slot: Slot, root: Slot },
+
+    #[error("already contains bank for slot {0}")]
+    AlreadyExists(Slot),
+
+    #[error("parent slot {parent_slot} for slot {slot} is no longer in BankForks")]
+    MissingParent { slot: Slot, parent_slot: Slot },
 }
 
 impl Index<u64> for BankForks {
@@ -257,6 +270,35 @@ impl BankForks {
 
     pub fn insert(&mut self, bank: Bank) -> BankWithScheduler {
         self.insert_with_scheduling_mode(SchedulingMode::BlockVerification, bank)
+    }
+
+    /// Inserts a bank only if the current fork graph still accepts it.
+    ///
+    /// This checked insert is intended for banks built from a `BankForks`
+    /// snapshot outside the write lock. By the time the caller is ready to
+    /// publish the bank, another writer may have rooted past the slot, inserted
+    /// the same slot, or pruned the selected parent. In those cases, returning a
+    /// structured error lets the caller discard stale work without panicking or
+    /// mutating `BankForks`.
+    pub fn try_insert(&mut self, bank: Bank) -> Result<BankWithScheduler, InsertBankError> {
+        self.validate_insert(&bank)?;
+        Ok(self.insert(bank))
+    }
+
+    fn validate_insert(&self, bank: &Bank) -> Result<(), InsertBankError> {
+        let slot = bank.slot();
+        let parent_slot = bank.parent_slot();
+        let root = self.root();
+        if slot <= root {
+            return Err(InsertBankError::AlreadyRooted { slot, root });
+        }
+        if self.banks.contains_key(&slot) {
+            return Err(InsertBankError::AlreadyExists(slot));
+        }
+        if !self.banks.contains_key(&parent_slot) {
+            return Err(InsertBankError::MissingParent { slot, parent_slot });
+        }
+        Ok(())
     }
 
     pub fn insert_with_scheduling_mode(
