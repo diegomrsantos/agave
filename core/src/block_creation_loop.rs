@@ -30,6 +30,7 @@ use {
         bank::{Bank, NewBankOptions},
         bank_forks::BankForks,
         block_component_processor::BlockComponentProcessor,
+        installed_scheduler_pool::BankWithScheduler,
         leader_schedule_utils::{last_of_consecutive_leader_slots, leader_slot_index},
         validated_block_finalization::ValidatedBlockFinalizationCert,
     },
@@ -152,6 +153,22 @@ enum StartLeaderError {
         /* parent ready slot */ Slot,
         /* leader slot */ Slot,
     ),
+
+    /// BankForks changed after leader-bank creation started.
+    #[error("Leader bank {0} became stale before insertion: {1}")]
+    StaleLeaderBank(/* leader slot */ Slot, InsertLeaderBankError),
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+enum InsertLeaderBankError {
+    #[error("slot {0} is already rooted")]
+    AlreadyRooted(Slot),
+
+    #[error("already contains bank for leader slot {0}")]
+    AlreadyHaveBank(Slot),
+
+    #[error("parent slot {parent_slot} for leader slot {slot} is no longer in BankForks")]
+    StaleParent { slot: Slot, parent_slot: Slot },
 }
 
 /// The block creation loop.
@@ -627,6 +644,7 @@ fn start_leader_wait_for_parent_replay(
 /// If checks pass we return `Ok(())` and:
 /// - Reset poh to the `parent_slot`
 /// - Create a new bank for `slot` with parent `parent_slot`
+/// - Revalidate the root, slot, and parent under the BankForks write lock
 /// - Insert into bank_forks and poh recorder
 fn maybe_start_leader(
     slot: Slot,
@@ -649,13 +667,18 @@ fn maybe_start_leader(
     }
 
     // Create and insert the bank
-    create_and_insert_leader_bank(slot, parent_bank, ctx);
+    create_and_insert_leader_bank(slot, parent_bank, ctx)
+        .map_err(|err| StartLeaderError::StaleLeaderBank(slot, err))?;
     Ok(())
 }
 
 /// Creates and inserts the leader bank `slot` of this window with
 /// parent `parent_bank`
-fn create_and_insert_leader_bank(slot: Slot, parent_bank: Arc<Bank>, ctx: &mut LeaderContext) {
+fn create_and_insert_leader_bank(
+    slot: Slot,
+    parent_bank: Arc<Bank>,
+    ctx: &mut LeaderContext,
+) -> Result<(), InsertLeaderBankError> {
     let parent_slot = parent_bank.slot();
     let root_slot = ctx.bank_forks.read().unwrap().root();
     trace!(
@@ -715,7 +738,7 @@ fn create_and_insert_leader_bank(slot: Slot, parent_bank: Arc<Bank>, ctx: &mut L
     );
 
     // Insert the bank
-    let tpu_bank = ctx.bank_forks.write().unwrap().insert(tpu_bank);
+    let tpu_bank = insert_leader_bank(&ctx.bank_forks, tpu_bank)?;
     let bank_id = tpu_bank.bank_id();
     ctx.poh_recorder.write().unwrap().set_bank(tpu_bank);
 
@@ -730,6 +753,27 @@ fn create_and_insert_leader_bank(slot: Slot, parent_bank: Arc<Bank>, ctx: &mut L
         "{}: new fork:{} parent:{} (leader) root:{}",
         ctx.my_pubkey, slot, parent_slot, root_slot
     );
+    Ok(())
+}
+
+fn insert_leader_bank(
+    bank_forks: &RwLock<BankForks>,
+    tpu_bank: Bank,
+) -> Result<BankWithScheduler, InsertLeaderBankError> {
+    let slot = tpu_bank.slot();
+    let parent_slot = tpu_bank.parent_slot();
+    let mut bank_forks = bank_forks.write().unwrap();
+    let root = bank_forks.root();
+    if slot <= root {
+        return Err(InsertLeaderBankError::AlreadyRooted(slot));
+    }
+    if bank_forks.get(slot).is_some() {
+        return Err(InsertLeaderBankError::AlreadyHaveBank(slot));
+    }
+    if bank_forks.get(parent_slot).is_none() {
+        return Err(InsertLeaderBankError::StaleParent { slot, parent_slot });
+    }
+    Ok(bank_forks.insert(tpu_bank))
 }
 
 ///  If this the very first alpenglow block, include the genesis certificate
@@ -760,4 +804,136 @@ fn maybe_include_genesis_certificate(parent_slot: Slot, ctx: &LeaderContext) {
             &ctx.bank_forks.read().unwrap().migration_status(),
         )
         .expect("Recording genesis certificate should not fail");
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::*, solana_clock::BankId, solana_ledger::genesis_utils::create_genesis_config,
+        solana_runtime::bank::SlotLeader,
+    };
+
+    const TEST_GENESIS_LAMPORTS: u64 = 10_000;
+    const GENESIS_SLOT: Slot = 0;
+    const FIRST_LEADER_SLOT: Slot = 1;
+    const COMPETING_LEADER_SLOT: Slot = 2;
+    const CHILD_OF_STALE_PARENT_SLOT: Slot = 3;
+
+    struct TestForks {
+        bank_forks: Arc<RwLock<BankForks>>,
+    }
+
+    impl TestForks {
+        fn new() -> Self {
+            let genesis = create_genesis_config(TEST_GENESIS_LAMPORTS);
+            let genesis_bank = Bank::new_for_tests(&genesis.genesis_config);
+            Self {
+                bank_forks: BankForks::new_rw_arc(genesis_bank),
+            }
+        }
+
+        fn bank(&self, slot: Slot) -> Option<Arc<Bank>> {
+            self.bank_forks.read().unwrap().get(slot)
+        }
+
+        fn leader_bank(&self, parent_slot: Slot, slot: Slot) -> Bank {
+            Bank::new_from_parent(
+                self.bank(parent_slot)
+                    .expect("test parent slot should exist"),
+                SlotLeader::default(),
+                slot,
+            )
+        }
+
+        fn insert_leader_bank(&self, parent_slot: Slot, slot: Slot) -> BankWithScheduler {
+            insert_leader_bank(&self.bank_forks, self.leader_bank(parent_slot, slot)).unwrap()
+        }
+
+        fn set_root(&self, slot: Slot) {
+            self.bank_forks.write().unwrap().set_root(slot, None, None);
+        }
+
+        fn working_slot(&self) -> Slot {
+            self.bank_forks.read().unwrap().working_bank().slot()
+        }
+
+        fn fork_state_for(&self, slot: Slot) -> (usize, Option<BankId>) {
+            let bank_forks = self.bank_forks.read().unwrap();
+            (
+                bank_forks.len(),
+                bank_forks.get(slot).map(|bank| bank.bank_id()),
+            )
+        }
+    }
+
+    fn assert_rejected_without_changing_forks(
+        forks: &TestForks,
+        bank: Bank,
+        expected_error: InsertLeaderBankError,
+    ) {
+        let slot = bank.slot();
+        let before = forks.fork_state_for(slot);
+        match insert_leader_bank(&forks.bank_forks, bank) {
+            Ok(bank) => panic!("unexpectedly inserted leader bank {}", bank.slot()),
+            Err(error) => assert_eq!(error, expected_error),
+        }
+        assert_eq!(forks.fork_state_for(slot), before);
+    }
+
+    #[test]
+    fn test_insert_leader_bank_accepts_current_parent() {
+        let forks = TestForks::new();
+
+        let inserted_bank = forks.insert_leader_bank(GENESIS_SLOT, FIRST_LEADER_SLOT);
+
+        assert_eq!(inserted_bank.slot(), FIRST_LEADER_SLOT);
+        assert_eq!(forks.working_slot(), FIRST_LEADER_SLOT);
+    }
+
+    #[test]
+    fn test_insert_leader_bank_rejects_duplicate_slot() {
+        let forks = TestForks::new();
+        forks.insert_leader_bank(GENESIS_SLOT, FIRST_LEADER_SLOT);
+
+        assert_rejected_without_changing_forks(
+            &forks,
+            forks.leader_bank(GENESIS_SLOT, FIRST_LEADER_SLOT),
+            InsertLeaderBankError::AlreadyHaveBank(FIRST_LEADER_SLOT),
+        );
+    }
+
+    #[test]
+    fn test_insert_leader_bank_rejects_already_rooted_slot() {
+        let forks = TestForks::new();
+        let bank_built_before_its_slot_was_rooted =
+            forks.leader_bank(GENESIS_SLOT, FIRST_LEADER_SLOT);
+        forks.insert_leader_bank(GENESIS_SLOT, FIRST_LEADER_SLOT);
+        forks.set_root(FIRST_LEADER_SLOT);
+
+        assert_rejected_without_changing_forks(
+            &forks,
+            bank_built_before_its_slot_was_rooted,
+            InsertLeaderBankError::AlreadyRooted(FIRST_LEADER_SLOT),
+        );
+    }
+
+    #[test]
+    fn test_insert_leader_bank_rejects_stale_parent() {
+        let forks = TestForks::new();
+        forks.insert_leader_bank(GENESIS_SLOT, FIRST_LEADER_SLOT);
+        forks.insert_leader_bank(GENESIS_SLOT, COMPETING_LEADER_SLOT);
+
+        let bank_built_on_pruned_parent =
+            forks.leader_bank(FIRST_LEADER_SLOT, CHILD_OF_STALE_PARENT_SLOT);
+        forks.set_root(COMPETING_LEADER_SLOT);
+
+        assert_rejected_without_changing_forks(
+            &forks,
+            bank_built_on_pruned_parent,
+            InsertLeaderBankError::StaleParent {
+                slot: CHILD_OF_STALE_PARENT_SLOT,
+                parent_slot: FIRST_LEADER_SLOT,
+            },
+        );
+    }
 }
